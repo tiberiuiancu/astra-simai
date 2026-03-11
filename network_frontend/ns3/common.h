@@ -975,8 +975,8 @@ void SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),void (*send_fini
   for (uint32_t i = 0; i < node_num; i++) {
     if (n.Get(i)->GetNodeType() == 1) { 
       Ptr<SwitchNode> sw = DynamicCast<SwitchNode>(n.Get(i));
-      sw->SetAttribute("CcMode", UintegerValue(cc_mode));
-      sw->SetAttribute("MaxRtt", UintegerValue(maxRtt));
+      sw->SetAttributeFailSafe("CcMode", UintegerValue(cc_mode));
+      sw->SetAttributeFailSafe("MaxRtt", UintegerValue(maxRtt));
     }
   }
 

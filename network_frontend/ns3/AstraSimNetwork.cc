@@ -33,6 +33,10 @@
 #include <thread>
 #include <unistd.h>
 #include <vector>
+// simulon bridge headers (paths relative to csrc/ include root)
+#include "astra_bindings/ns3_runner.hh"
+#include "astra_bindings/topology_bridge.hh"
+#include "astra_bindings/workload_bridge.hh"
 #ifdef NS3_MTP
 #include "ns3/mtp-interface.h"
 #endif
@@ -72,19 +76,7 @@ public:
   ~ASTRASimNetwork() {}
   int sim_comm_size(AstraSim::sim_comm comm, int *size) { return 0; }
   int sim_finish() {
-    for (auto it = nodeHash.begin(); it != nodeHash.end(); it++) {
-      pair<int, int> p = it->first;
-      if (p.second == 0) {
-        std::cout << "sim_finish on sent, " << " Thread id: " << pthread_self() << std::endl;
-        cout << "All data sent from node " << p.first << " is " << it->second
-             << "\n";
-      } else {
-        std::cout << "sim_finish on received, " << " Thread id: " << pthread_self() << std::endl;
-        cout << "All data received by node " << p.first << " is " << it->second
-             << "\n";
-      }
-    }
-    exit(0);
+    // Do not call exit() — this runs inside a Python .so library.
     return 0;
   }
   double sim_time_resolution() { return 0; }
@@ -333,3 +325,155 @@ int main(int argc, char *argv[]) {
   #endif
   return 0;
 }
+
+// ---------------------------------------------------------------------------
+// simulon::astra::run_ns3 — in-process NS3 simulation entry point
+// Defined here so it shares ASTRASimNetwork class and NS3 globals.
+// ---------------------------------------------------------------------------
+
+namespace simulon {
+namespace astra {
+
+static std::string ns3_write_temp_file(const std::string& content,
+                                        const std::string& suffix) {
+    char buf[256];
+    snprintf(buf, sizeof(buf), "/tmp/simulon_ns3_XXXXXX%s", suffix.c_str());
+    int fd = mkstemps(buf, static_cast<int>(suffix.size()));
+    if (fd < 0) throw std::runtime_error("Cannot create temp file for NS3");
+    ::write(fd, content.data(), content.size());
+    ::close(fd);
+    return std::string(buf);
+}
+
+static std::string make_ns3_conf(const NetworkTopology& /*topo*/,
+                                  const WorkloadTrace& /*wl*/) {
+    return "CC_MODE 3\nENABLE_QCN 1\nUSE_DYNAMIC_PFC_THRESHOLD 1\n"
+           "PAUSE_TIME 5\nPACKET_PAYLOAD_SIZE 1024\n"
+           "L2_CHUNK_SIZE 4000\nL2_ACK_INTERVAL 156\nL2_BACK_TO_ZERO 0\n"
+           "BUFFER_SIZE 600\nSIMULATOR_STOP_TIME 10000000.0\nENABLE_TRACE 0\n"
+           "DATA_RATE 100Gbps\nLINK_DELAY 1us\n"
+           "RATE_AI 50Mbps\nRATE_HAI 100Mbps\nMIN_RATE 100Mbps\n"
+           "DCTCP_RATE_AI 1000Mbps\nERROR_RATE_PER_LINK 0\n"
+           "FLOW_FILE /dev/null\nTRACE_FILE /dev/null\n"
+           "TRACE_OUTPUT_FILE /dev/null\nFCT_OUTPUT_FILE /dev/null\n"
+           "PFC_OUTPUT_FILE /dev/null\nSEND_OUTPUT_FILE /dev/null\n"
+           "QLEN_MON_FILE /dev/null\nBW_MON_FILE /dev/null\n"
+           "RATE_MON_FILE /dev/null\nCNP_MON_FILE /dev/null\n";
+}
+
+AnalyticalResults run_ns3(
+    const NetworkTopology& topology,
+    const WorkloadTrace& workload
+) {
+    AnalyticalResults results;
+    results.success = false;
+    results.total_time_ns = 0.0;
+    results.compute_time_ns = 0.0;
+    results.communication_time_ns = 0.0;
+    results.completed_layers = 0;
+
+    std::string topo_path, conf_path;
+    try {
+        NetWorkParam net_param = toNetWorkParam(topology);
+        UserParam::getInstance()->net_work_param = net_param;
+
+        topo_path = ns3_write_temp_file(toTopoFileContent(topology), ".txt");
+        conf_path = ns3_write_temp_file(make_ns3_conf(topology, workload), ".txt");
+
+        if (main1(topo_path, conf_path) != 0) {
+            results.error_message = "NS3 network initialization failed";
+            ::unlink(topo_path.c_str());
+            ::unlink(conf_path.c_str());
+            return results;
+        }
+
+        // After main1(): node_num, switch_num, nvswitch_num, gpus_per_server set.
+        int nodes_num = static_cast<int>(node_num - switch_num);   // GPUs + NVSwitches
+        int gpu_num   = static_cast<int>(node_num - nvswitch_num - switch_num);  // GPUs only
+
+        // Populate NVswitchs vector (mirrors the logic in original main())
+        NVswitchs.clear();
+        for (int i = gpu_num; i < gpu_num + static_cast<int>(nvswitch_num); ++i) {
+            NVswitchs.push_back(i);
+        }
+
+        // Build node→nvswitch map
+        std::map<int, int> node2nvswitch;
+        for (int i = 0; i < gpu_num; ++i) {
+            node2nvswitch[i] = gpu_num + i / static_cast<int>(gpus_per_server);
+        }
+        for (int i = gpu_num; i < gpu_num + static_cast<int>(nvswitch_num); ++i) {
+            node2nvswitch[i] = i;
+        }
+
+        std::vector<int> physical_dims  = {nodes_num};
+        std::vector<int> queues_per_dim = {1};
+
+        std::vector<ASTRASimNetwork*> networks(nodes_num, nullptr);
+        std::vector<AstraSim::Sys*>   systems(nodes_num, nullptr);
+
+        for (int j = 0; j < nodes_num; ++j) {
+            networks[j] = new ASTRASimNetwork(j, 0);
+            systems[j]  = new AstraSim::Sys(
+                networks[j],
+                nullptr,
+                j,
+                0,
+                1,
+                physical_dims,
+                queues_per_dim,
+                "",
+                "",          // workload path empty — we use DIRECT_INIT below
+                1.0, 1.0, 1.0,
+                1, 0,
+                "",          // no output path
+                "",          // no run name
+                false,       // separate_log disabled
+                false,       // rendezvous disabled
+                net_param.gpu_type,
+                {gpu_num},
+                NVswitchs,
+                static_cast<int>(gpus_per_server),
+                "DIRECT_INIT"
+            );
+            systems[j]->nvswitch_id = node2nvswitch[j];
+            systems[j]->num_gpus    = gpu_num;
+        }
+
+        bool all_ok = true;
+        for (int j = 0; j < nodes_num; ++j) {
+            initialize_workload_direct(systems[j]->workload, systems[j], workload);
+            if (!systems[j]->workload || !systems[j]->workload->initialized) {
+                all_ok = false;
+                break;
+            }
+        }
+
+        if (!all_ok) {
+            results.error_message = "Failed to initialize workload for all nodes";
+        } else {
+            for (int j = 0; j < nodes_num; ++j) {
+                systems[j]->workload->fire();
+            }
+
+            Simulator::Run();
+            results.total_time_ns    = static_cast<double>(
+                Simulator::Now().GetNanoSeconds());
+            results.completed_layers = workload.num_layers;
+            results.success          = true;
+            Simulator::Destroy();
+        }
+
+    } catch (const std::exception& e) {
+        results.error_message = std::string("NS3 simulation error: ") + e.what();
+    } catch (...) {
+        results.error_message = "Unknown NS3 simulation error";
+    }
+
+    if (!topo_path.empty()) ::unlink(topo_path.c_str());
+    if (!conf_path.empty()) ::unlink(conf_path.c_str());
+    return results;
+}
+
+}  // namespace astra
+}  // namespace simulon
